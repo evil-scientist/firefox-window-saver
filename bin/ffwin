@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""ffwin - save and restore Firefox windows, tabs and tab groups.
+
+Reads Firefox's own session file (sessionstore-backups/recovery.jsonlz4), which Firefox
+rewrites every ~15 s while it runs, and keeps snapshots as plain JSON in a folder that
+Firefox updates never touch (default ~/tools/firefox-window-saver/saves, override with $FFWIN_DIR).
+
+  ffwin list                       list saved snapshots
+  ffwin windows                    list windows open in Firefox right now
+  ffwin save [--all | --window N] [--name TEXT]
+  ffwin show  [SNAPSHOT]
+  ffwin restore [SNAPSHOT] [--window N | --all] [--mode urls|session]
+  ffwin save --from FILE           read another session file, e.g. previous.jsonlz4
+
+SNAPSHOT is a file name (or unique part of it), a number from `ffwin list`, or "latest".
+Without options the commands ask what to do. Standard library only.
+"""
+import argparse
+import configparser
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+MAGIC = b"mozLz40\0"
+APP_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SAVE_DIR = os.path.expanduser(os.environ.get("FFWIN_DIR", os.path.join(APP_DIR, "saves")))
+# Per-tab fields that are large or sensitive and not needed to reopen a tab.
+DROP_TAB_KEYS = ("image", "storage", "formdata", "scroll", "userTypedValue", "userTypedClear")
+
+
+# ---------------------------------------------------------------- LZ4 / mozlz4
+def lz4_decompress(src, size):
+    out = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        tok = src[i]
+        i += 1
+        ln = tok >> 4
+        if ln == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ln += b
+                if b != 255:
+                    break
+        out += src[i:i + ln]
+        i += ln
+        if i >= n:
+            break
+        off = src[i] | src[i + 1] << 8
+        i += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        start = len(out) - off
+        if off == 0 or start < 0:
+            raise ValueError("corrupt LZ4 data")
+        for k in range(ml):
+            out.append(out[start + k])
+    if len(out) != size:
+        raise ValueError("LZ4 size mismatch")
+    return bytes(out)
+
+
+def lz4_literal_block(data):
+    """A valid LZ4 block made of literals only (no compression; Firefox reads it fine)."""
+    n = len(data)
+    out = bytearray()
+    if n < 15:
+        out.append(n << 4)
+    else:
+        out.append(15 << 4)
+        r = n - 15
+        while r >= 255:
+            out.append(255)
+            r -= 255
+        out.append(r)
+    return bytes(out) + data
+
+
+def read_mozlz4(path):
+    with open(path, "rb") as f:
+        d = f.read()
+    if d[:8] != MAGIC:
+        raise ValueError(f"{path}: not a mozlz4 file")
+    size = int.from_bytes(d[8:12], "little")
+    return json.loads(lz4_decompress(d[12:], size))
+
+
+def write_mozlz4(path, obj):
+    raw = json.dumps(obj, separators=(",", ":")).encode()
+    with open(path, "wb") as f:
+        f.write(MAGIC + len(raw).to_bytes(4, "little") + lz4_literal_block(raw))
+
+
+# ---------------------------------------------------------------- Firefox profile
+def find_profile(explicit=None):
+    if explicit:
+        return os.path.expanduser(explicit)
+    roots = ["~/snap/firefox/common/.mozilla/firefox", "~/.mozilla/firefox",
+             "~/.config/mozilla/firefox", "~/.var/app/org.mozilla.firefox/.mozilla/firefox"]
+    for r in roots:
+        r = os.path.expanduser(r)
+        ini = os.path.join(r, "profiles.ini")
+        if not os.path.exists(ini):
+            continue
+        cp = configparser.ConfigParser()
+        cp.read(ini)
+        profs = [s for s in cp.sections() if s.startswith("Profile")]
+        best = next((s for s in profs if cp[s].get("Default") == "1"), profs[0] if profs else None)
+        if best:
+            p = cp[best]["Path"]
+            return p if cp[best].get("IsRelative", "1") == "0" else os.path.join(r, p)
+    sys.exit("Could not find a Firefox profile. Use --profile DIR.")
+
+
+def firefox_running(profile):
+    """Firefox keeps a 'lock' symlink in the profile while it runs; confirm with a process check."""
+    lock = os.path.join(profile, "lock")
+    if not (os.path.islink(lock) or os.path.exists(lock)):
+        return False
+    r = subprocess.run(["pgrep", "-x", "firefox"], capture_output=True)
+    return r.returncode == 0
+
+
+def session_file(profile):
+    for name in ("sessionstore-backups/recovery.jsonlz4", "sessionstore.jsonlz4",
+                 "sessionstore-backups/previous.jsonlz4"):
+        p = os.path.join(profile, name)
+        if os.path.exists(p):
+            return p
+    sys.exit(f"No session file found in {profile}")
+
+
+# ---------------------------------------------------------------- window model
+def tab_url(t):
+    e = t.get("entries") or []
+    if not e:
+        return ""
+    i = min(max(t.get("index", len(e)), 1), len(e)) - 1
+    return e[i].get("url", "")
+
+
+def tab_title(t):
+    e = t.get("entries") or []
+    if not e:
+        return ""
+    i = min(max(t.get("index", len(e)), 1), len(e)) - 1
+    return e[i].get("title") or ""
+
+
+def clean_window(w):
+    """Keep what is needed to reopen the window; drop closed-tab history and bulky data."""
+    keep = ("tabs", "groups", "selected", "sizemode", "width", "height", "screenX", "screenY")
+    out = {k: w[k] for k in keep if k in w}
+    out["tabs"] = [{k: v for k, v in t.items() if k not in DROP_TAB_KEYS} for t in w.get("tabs", [])]
+    return out
+
+
+def describe(w, n=None):
+    tabs = w.get("tabs", [])
+    groups = {g["id"]: g for g in w.get("groups", [])}
+    counts = {}
+    for t in tabs:
+        gid = t.get("groupId")
+        if gid in groups:
+            counts[gid] = counts.get(gid, 0) + 1
+    pinned = sum(1 for t in tabs if t.get("pinned"))
+    sel = tabs[w.get("selected", 1) - 1] if tabs else {}
+    head = f"{len(tabs)} tabs"
+    if pinned:
+        head += f", {pinned} pinned"
+    lines = [f"{head}   (active: {tab_title(sel)[:50] or tab_url(sel)[:50]})"]
+    for gid, c in counts.items():
+        g = groups[gid]
+        lines.append(f"      group '{g.get('name') or '(unnamed)'}' [{g.get('color', '')}]: {c} tabs")
+    return lines
+
+
+def print_windows(wins):
+    for i, w in enumerate(wins, 1):
+        l = describe(w)
+        print(f"  {i}. {l[0]}")
+        for x in l[1:]:
+            print(x)
+
+
+def choose_windows(wins, window_arg, all_flag, verb):
+    if not wins:
+        sys.exit("No windows found.")
+    if all_flag:
+        return list(range(len(wins)))
+    if window_arg:
+        idx = parse_numbers(window_arg, len(wins))
+        return idx
+    if len(wins) == 1:
+        return [0]
+    print(f"Windows available to {verb}:")
+    print_windows(wins)
+    ans = input("Which? numbers like 1,2 or 'a' for all [a]: ").strip().lower()
+    return list(range(len(wins))) if ans in ("", "a", "all") else parse_numbers(ans, len(wins))
+
+
+def parse_numbers(s, n):
+    out = []
+    for part in re.split(r"[,\s]+", s.strip()):
+        if not part:
+            continue
+        if not part.isdigit() or not 1 <= int(part) <= n:
+            sys.exit(f"Bad window number '{part}' (valid: 1-{n})")
+        out.append(int(part) - 1)
+    return out
+
+
+# ---------------------------------------------------------------- snapshots
+def snapshots():
+    return sorted(glob.glob(os.path.join(SAVE_DIR, "*.json")))
+
+
+def load_snapshot(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def resolve_snapshot(ref):
+    snaps = snapshots()
+    if not snaps:
+        sys.exit(f"No snapshots in {SAVE_DIR}. Run `ffwin save` first.")
+    if ref in (None, "latest"):
+        return snaps[-1] if ref == "latest" or len(snaps) == 1 else pick_snapshot(snaps)
+    if ref.isdigit() and 1 <= int(ref) <= len(snaps):
+        return snaps[int(ref) - 1]
+    if os.path.exists(ref):
+        return ref
+    m = [s for s in snaps if ref in os.path.basename(s)]
+    if len(m) == 1:
+        return m[0]
+    sys.exit(f"Snapshot '{ref}' matched {len(m)} files. Use `ffwin list`.")
+
+
+def pick_snapshot(snaps):
+    print_snapshot_list(snaps)
+    a = input(f"Snapshot number [{len(snaps)}]: ").strip()
+    return snaps[int(a) - 1] if a else snaps[-1]
+
+
+def print_snapshot_list(snaps):
+    for i, p in enumerate(snaps, 1):
+        try:
+            s = load_snapshot(p)
+            ws = s["windows"]
+            info = f"{len(ws)} window(s), {sum(len(w['tabs']) for w in ws)} tabs"
+            print(f"{i:3}. {os.path.basename(p)}   {info}   {s.get('name', '')}")
+        except Exception as e:  # noqa: BLE001
+            print(f"{i:3}. {os.path.basename(p)}   (unreadable: {e})")
+
+
+# ---------------------------------------------------------------- commands
+def cmd_windows(args):
+    sess = read_mozlz4(args.src or session_file(find_profile(args.profile)))
+    print_windows(sess["windows"])
+
+
+def cmd_save(args):
+    src = args.src or session_file(find_profile(args.profile))
+    sess = read_mozlz4(src)
+    wins = sess["windows"]
+    sel = choose_windows(wins, args.window, args.all, "save")
+    chosen = [clean_window(wins[i]) for i in sel]
+    now = datetime.datetime.now()
+    name = args.name or ("all windows" if len(sel) == len(wins) else f"window {','.join(str(i + 1) for i in sel)}")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")[:40] or "snapshot"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    path = os.path.join(SAVE_DIR, f"{now:%Y-%m-%d_%H%M%S}_{slug}.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"version": 1, "saved": now.isoformat(timespec="seconds"), "name": name,
+                   "source": os.path.basename(src), "windows": chosen}, f)
+    os.replace(tmp, path)  # atomic: never leaves a half-written snapshot
+    ntabs = sum(len(w["tabs"]) for w in chosen)
+    ngroups = sum(len(w.get("groups", [])) for w in chosen)
+    print(f"Saved {len(chosen)} window(s), {ntabs} tabs, {ngroups} tab group(s)\n  -> {path}")
+
+
+def cmd_list(args):
+    snaps = snapshots()
+    if not snaps:
+        print(f"No snapshots in {SAVE_DIR}")
+    print_snapshot_list(snaps)
+
+
+def cmd_show(args):
+    p = resolve_snapshot(args.snapshot)
+    s = load_snapshot(p)
+    print(f"{p}\nsaved {s['saved']}  ({s.get('name', '')})")
+    for i, w in enumerate(s["windows"], 1):
+        groups = {g["id"]: g for g in w.get("groups", [])}
+        print(f"\nWindow {i}: {describe(w)[0]}")
+        last = object()
+        for t in w["tabs"]:
+            gid = t.get("groupId")
+            if gid != last:
+                print(f"  [group: {groups[gid].get('name') or '(unnamed)'}]" if gid in groups else "  [no group]")
+                last = gid
+            print(f"    {'*' if t.get('pinned') else ' '} {tab_title(t)[:60]:60}  {tab_url(t)[:80]}")
+
+
+OPENABLE = re.compile(r"^(https?|ftp|file|view-source|moz-extension):", re.I)
+
+
+def restore_urls(wins, sel, firefox):
+    """Open each window with its tabs through the Firefox command line.
+    Works while Firefox runs. Tab groups and pinning cannot be set this way."""
+    skipped = 0
+    for i in sel:
+        urls = []
+        for t in wins[i]["tabs"]:
+            u = tab_url(t)
+            if OPENABLE.match(u):
+                urls.append(u)
+            else:
+                skipped += 1
+        if not urls:
+            continue
+        subprocess.Popen([firefox, "--new-window", *urls], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        print(f"  opened window {i + 1}: {len(urls)} tabs")
+        import time
+        time.sleep(1.5)  # let Firefox finish one window before the next request
+    if skipped:
+        print(f"  ({skipped} about:/internal tabs skipped)")
+    print("Note: tab groups and pinned tabs are NOT recreated in this mode. "
+          "Use --mode session with Firefox closed for those.")
+
+
+def restore_session(wins, sel, profile, firefox):
+    """Write the chosen windows into the profile's session file, then start Firefox.
+    Restores tab groups, pinned tabs and back/forward history. Needs Firefox closed."""
+    if firefox_running(profile):
+        sys.exit("Firefox is running. Close it completely first, or use --mode urls.")
+    sdir = os.path.join(profile, "sessionstore-backups")
+    os.makedirs(sdir, exist_ok=True)
+    target = os.path.join(sdir, "recovery.jsonlz4")
+    sess = {"version": ["sessionrestore", 1], "windows": [], "_closedWindows": [], "savedGroups": [],
+            "session": {"lastUpdate": int(datetime.datetime.now().timestamp() * 1000), "startTime":
+                        int(datetime.datetime.now().timestamp() * 1000), "recentCrashes": 0},
+            "global": {}, "selectedWindow": 1}
+    if os.path.exists(target):  # keep whatever session Firefox had
+        try:
+            cur = read_mozlz4(target)
+            sess.update({k: v for k, v in cur.items() if k != "windows"})
+            sess["windows"] = list(cur.get("windows", []))
+        except Exception:  # noqa: BLE001
+            pass
+        bk = target + ".before-ffwin-" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        shutil.copy2(target, bk)
+        print(f"  backed up current session -> {bk}")
+    for i in sel:
+        sess["windows"].append(json.loads(json.dumps(wins[i])))
+    write_mozlz4(target, sess)
+    print(f"  wrote {len(sel)} window(s) into the session file")
+    if firefox:
+        subprocess.Popen([firefox, "--profile", profile], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        print("  started Firefox (if it shows a 'Restore session' page, click it)")
+
+
+def cmd_restore(args):
+    snap = load_snapshot(resolve_snapshot(args.snapshot))
+    wins = snap["windows"]
+    sel = choose_windows(wins, args.window, args.all, "restore")
+    profile = find_profile(args.profile)
+    firefox = shutil.which("firefox") or "firefox"
+    mode = args.mode
+    if mode is None:
+        mode = "urls" if firefox_running(profile) else "session"
+        print(f"Firefox is {'running' if mode == 'urls' else 'not running'}: using mode '{mode}'.")
+    if mode == "urls":
+        restore_urls(wins, sel, firefox)
+    else:
+        restore_session(wins, sel, profile, firefox)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Save and restore Firefox windows, tabs and tab groups.")
+    ap.add_argument("--profile", help="Firefox profile directory (auto-detected by default)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("save", help="save windows to a snapshot")
+    s.add_argument("--all", action="store_true", help="save every window")
+    s.add_argument("--window", metavar="N[,N]", help="save only these window numbers (see `ffwin windows`)")
+    s.add_argument("--name", help="label for the snapshot")
+    s.add_argument("--from", dest="src", metavar="FILE", help="read this .jsonlz4 session file instead")
+    s.set_defaults(fn=cmd_save)
+
+    s = sub.add_parser("windows", help="list windows open now")
+    s.add_argument("--from", dest="src", metavar="FILE")
+    s.set_defaults(fn=cmd_windows)
+
+    s = sub.add_parser("list", help="list snapshots")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("show", help="show tabs in a snapshot")
+    s.add_argument("snapshot", nargs="?")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("restore", help="reopen windows from a snapshot")
+    s.add_argument("snapshot", nargs="?")
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--window", metavar="N[,N]", help="window numbers inside the snapshot")
+    s.add_argument("--mode", choices=("urls", "session"),
+                   help="urls: works with Firefox open, no groups. session: Firefox closed, keeps groups")
+    s.set_defaults(fn=cmd_restore)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        sys.exit("\nCancelled.")
