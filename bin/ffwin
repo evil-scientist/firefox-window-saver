@@ -169,6 +169,14 @@ def clean_window(w):
     return out
 
 
+BLANK_URLS = ("", "about:blank", "about:newtab", "about:home", "about:privatebrowsing")
+
+
+def is_blank_window(w):
+    """True for a window that only holds empty tabs (what Firefox leaves behind on a clean exit)."""
+    return all(tab_url(t) in BLANK_URLS for t in w.get("tabs", []))
+
+
 def describe(w, n=None):
     tabs = w.get("tabs", [])
     groups = {g["id"]: g for g in w.get("groups", [])}
@@ -353,28 +361,47 @@ def restore_session(wins, sel, profile, firefox):
     sdir = os.path.join(profile, "sessionstore-backups")
     os.makedirs(sdir, exist_ok=True)
     target = os.path.join(sdir, "recovery.jsonlz4")
+    now_ms = int(datetime.datetime.now().timestamp() * 1000)
     sess = {"version": ["sessionrestore", 1], "windows": [], "_closedWindows": [], "savedGroups": [],
-            "session": {"lastUpdate": int(datetime.datetime.now().timestamp() * 1000), "startTime":
-                        int(datetime.datetime.now().timestamp() * 1000), "recentCrashes": 0},
+            "session": {"lastUpdate": now_ms, "startTime": now_ms, "recentCrashes": 0},
             "global": {}, "selectedWindow": 1}
-    if os.path.exists(target):  # keep whatever session Firefox had
-        try:
-            cur = read_mozlz4(target)
-            sess.update({k: v for k, v in cur.items() if k != "windows"})
-            sess["windows"] = list(cur.get("windows", []))
-        except Exception:  # noqa: BLE001
-            pass
-        bk = target + ".before-ffwin-" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        shutil.copy2(target, bk)
-        print(f"  backed up current session -> {bk}")
+    # After a clean exit Firefox leaves the session in sessionstore.jsonlz4 and no recovery.jsonlz4,
+    # so look at both to keep the windows that were open.
+    stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    old = os.path.join(profile, "sessionstore.jsonlz4")
+    for src in (target, old):
+        if not os.path.exists(src):
+            continue
+        shutil.copy2(src, src + ".before-ffwin-" + stamp)
+        print(f"  backed up {os.path.basename(src)} -> {os.path.basename(src)}.before-ffwin-{stamp}")
+    for src in (target, old):
+        if os.path.exists(src):
+            try:
+                cur = read_mozlz4(src)
+                sess.update({k: v for k, v in cur.items() if k not in ("windows", "session")})
+                sess["windows"] = [w for w in cur.get("windows", []) if not is_blank_window(w)]
+                break
+            except Exception:  # noqa: BLE001
+                continue
+    # Firefox only restores at startup after a crash or with "restore previous session" set.
+    # Marking the session as still 'running' makes it look like a crash, so it restores by itself.
+    sess["session"]["state"] = "running"
+    if os.path.exists(old):
+        os.remove(old)  # otherwise Firefox may prefer this older file
+    have = {tuple(tab_url(t) for t in w.get("tabs", [])) for w in sess["windows"]}
+    added = 0
     for i in sel:
+        if tuple(tab_url(t) for t in wins[i].get("tabs", [])) in have:
+            print(f"  window {i + 1} is already in the session, skipped")
+            continue
         sess["windows"].append(json.loads(json.dumps(wins[i])))
+        added += 1
     write_mozlz4(target, sess)
-    print(f"  wrote {len(sel)} window(s) into the session file")
+    print(f"  wrote {added} window(s) into the session file")
     if firefox:
         subprocess.Popen([firefox, "--profile", profile], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
-        print("  started Firefox (if it shows a 'Restore session' page, click it)")
+        print("  started Firefox")
 
 
 def cmd_restore(args):
