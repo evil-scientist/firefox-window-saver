@@ -18,7 +18,12 @@ Restore modes:
 
 - `session` (default when Firefox is closed): writes the windows into the profile's session file and
   starts Firefox. Keeps tab groups, pinned tabs and history. The current session file is backed up first.
-- `urls` (default while Firefox is open): opens each window's tabs from the command line. Tab groups
-  and pinned tabs are not recreated.
+  If Firefox is running, ffwin waits for you to quit it (Ctrl+Shift+Q), then restores. The windows that
+  were open come back as well.
+- `urls`: opens each window's tabs from the command line in the running Firefox. Tab groups and
+  pinned tabs are not recreated, because the Firefox command line only accepts URLs.
+
+Without `--mode`, ffwin uses `session` when Firefox is closed. When Firefox is open, it uses `urls` if the
+windows have no tab groups or pinned tabs; otherwise it asks whether to quit Firefox and use `session`.
 
 The profile is found automatically (snap, Flatpak, or regular install); use `--profile DIR` to override.
